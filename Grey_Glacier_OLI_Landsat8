@@ -1,0 +1,240 @@
+///camada mascára para o recorte da zona de interesse
+var mask = 
+   /* color: #0b4a8b */
+    /* displayProperties: [
+      {
+        "type": "rectangle"
+      }
+    ] */
+    ee.Geometry.Polygon(
+        [[[-73.3215365999813, -50.90204402106767],
+          [-73.3215365999813, -51.07299320311123],
+          [-73.09494358240318, -51.07299320311123],
+          [-73.09494358240318, -50.90204402106767]]], null, false);
+          
+////// amostra de teste para água
+var sample_water =    /* color: #00ffff */
+    /* displayProperties: [
+      {
+        "type": "rectangle"
+      }
+    ] */
+    ee.Geometry.Polygon(
+        [[[-73.18715155586813, -50.99193362856772],
+          [-73.18715155586813, -50.993770421569515],
+          [-73.18509161934469, -50.993770421569515],
+          [-73.18509161934469, -50.99193362856772]]], null, false);
+
+
+          
+////// amostra de teste para a geleira
+var sample_ndsi =  /* color: #009999 */ee.Geometry.Polygon(
+        [[[-73.2692017686606, -50.9654759428011],
+          [-73.26611186387544, -50.98644462027365],
+          [-73.25375224473481, -50.96871914068687],
+          [-73.23864604356294, -50.98860580123861],
+          [-73.23040629746919, -50.96742188870485],
+          [-73.2032837999106, -50.98449947137192],
+          [-73.21701671006684, -50.95120318194075]]]);
+
+       
+
+//Adicionando o shape da geleira pelo GLIMS. Disponível em:  https://www.glims.org/maps/glims
+var glims = ee.FeatureCollection("users/jmelzertbr/Shapes_unidos_fix");
+var glims = glims.filter(ee.Filter.eq('ID', 232))
+print(glims)
+/////// Recorte do shape do GLIMS para a area de interesse
+var glims_frente = mask.intersection(glims, ee.ErrorMargin(1));
+
+
+// Criando uma imagem vazia para pintar os recursos, convertidos em bytes.
+var empty = ee.Image().byte();
+
+
+// Pintando todas as arestas do polígono com o mesmo número e largura.
+var glims_draw = empty.paint({
+  featureCollection: glims,
+  color: 'id',
+  width: 2
+});
+var palette = ['FF0000', '00FF00'];
+
+
+// Centralizando o mapa para a área de interesse
+Map.centerObject(glims, 10);
+
+
+//////////////////////////////////////////////////////
+//Obtendo modelo Digital de elevação----------------------------------------
+var dem = ee.Image('JAXA/ALOS/AW3D30_V1_1');
+
+//Clipando o DEM com a camada máscara
+var dem = dem.select('AVE').clip(mask);
+
+
+//Obtendo a imagem landsat///////////////////////////
+var landsat = ee.ImageCollection('LANDSAT/LC08/C01/T1_TOA')
+                  .filterDate('2016-02-01', '2016-02-03')
+                  .filterBounds(glims)
+                  .select(['B1','B2','B3','B4','B5','B6','B7'], 
+  ['B1','B2','B3','B4','B5','B6','B7']);
+var landsat = landsat.mosaic().clip(mask);
+print(landsat)
+
+
+//Aplicando método do pixel negro////////////////////////////////////
+// Calcular o mínimo para cada banda
+var dos = landsat.reduceRegion({
+  reducer: ee.Reducer.min(),
+  geometry: glims.geometry(),
+  scale: 30,
+  maxPixels: 1e9
+});
+print(dos);
+
+var b1=landsat.select(['B1']).subtract(ee.Number(dos.get('B1')))
+var b2=landsat.select(['B2']).subtract(ee.Number(dos.get('B2')))
+var b3=landsat.select(['B3']).subtract(ee.Number(dos.get('B3')))
+var b4=landsat.select(['B4']).subtract(ee.Number(dos.get('B4')))
+var b5=landsat.select(['B5']).subtract(ee.Number(dos.get('B5')))
+var b6=landsat.select(['B6']).subtract(ee.Number(dos.get('B6')))
+var b7=landsat.select(['B7']).subtract(ee.Number(dos.get('B7')))
+
+
+//NDWI////////////////////////////////
+var ndwi = b3.subtract(b5).divide(b3.add(b5)).rename('NDWI');
+var histogram = ui.Chart.image.histogram(ndwi, mask, 30);
+
+
+//Máscara de água
+//Calculo do limiar 
+var min_ndwi = ndwi.reduceRegion({
+  reducer: ee.Reducer.min(), 
+  geometry: sample_water,
+  scale: 30,
+  maxPixels: 1e9
+});
+print(min_ndwi.get('NDWI'))
+
+
+var water = ndwi.lte(ee.Number(min_ndwi.get('NDWI')));
+
+
+//NDSI////////////////////////////////////
+var ndsi = b3.subtract(b7).divide(b3.add(b7)).rename('NDSI');
+print(ndsi)
+var histogram = ui.Chart.image.histogram(ndsi, glims, 30);
+print(histogram)
+
+//calculo do limiar
+var min_ndsi = ndsi.reduceRegion({
+  reducer: ee.Reducer.min(), 
+  geometry: sample_ndsi,
+  scale: 30,
+  maxPixels: 1e9
+});
+print(min_ndsi.get('NDSI'))
+var ndsi_mask = ndsi.gte(ee.Number(min_ndsi.get('NDSI'))).multiply(water);
+
+
+///////////////////////////////////////////////
+//Filtro de passa baixa para eliminar pequenos polígonos
+// Define a boxcar or low-pass kernel.
+var boxcar = ee.Kernel.square({
+  radius: 7, units: 'pixels', normalize: true
+});
+
+// Suavize a imagem convolvendo com a boxcar kernel.
+// Define a kernel.
+var kernel = ee.Kernel.circle({radius: 5});
+
+var mask_smooth = ndsi_mask.focal_mode({kernel: kernel, iterations: 1})
+
+
+///////////////////// Raster para vetor////////
+var vect_ndsi_mask = ndsi_mask.addBands(ndsi).reduceToVectors({
+  crs: ndsi.projection(),
+  scale: 90,
+  geometryType: 'polygon',
+  eightConnected: false,
+  labelProperty: 'zone',
+  reducer: ee.Reducer.mean()
+});
+
+//Filtrando apenas o que foi classificado como geleira
+var grey_j = vect_ndsi_mask.filter(ee.Filter.eq('zone', 1));
+
+
+// Essa função calcula a área de geometria do recurso e a adiciona como uma propriedade.
+var addArea = function(feature) {
+  return feature.set({areaHa: feature.geometry().area(1).divide(100 * 100)});
+};
+
+
+// Mapeando a função de obtenção de área sobre o FeatureCollection.
+var areaAdded = grey_j.map(addArea);
+
+
+// Filtro para obter os poligonos de maior área (Geleira). 
+var glacier = areaAdded.filter(ee.Filter.gt('areaHa', 2000));
+
+
+///////////////////////////////////////
+//Construindo simbologias
+var ndsi_vis = {
+  min: -1,
+  max: -0.85,
+  palette: ['blue','white', 'yellow','green'],
+};
+
+var ndwi_vis = {
+  min: -1,
+  max: 1,
+  palette: ['blue','white', 'green'],
+};
+
+var vis = {
+  bands: ['B4', 'B3', 'B2'],
+  min: 0.0,
+  max: 1,
+  gamma: 1.2,
+};
+
+var dem_vis = {
+    min: 0.0,
+  max: 4000.0,
+  palette: ['0000ff', '00ffff', 'ffff00', 'ff0000', 'ffffff'],
+};
+
+
+/////////////////Adicionando Layers
+//Adicionando raster de elevação
+//Map.addLayer(dem, dem_vis, 'Elevation', 0);
+
+//Adicionando máscara de água
+//Map.addLayer(water,{},'Water');
+
+//Adicionando o NDSI
+//Map.addLayer(ndsi,{},'NDSI',0)
+
+//Adicionando o raster classificado com a máscara da água
+//Map.addLayer(ndsi_mask,{},'NDSI Mask',0)
+
+//Adicionando a imagem landsat
+Map.addLayer(landsat, vis,'LANDSAT - Visível');
+
+//Adicionando o shape de toda geleira pelo GLIMS
+Map.addLayer(glims_draw, {palette: palette, max: 4}, 'Glacier GLIMS', 1, 1);
+
+//Adicionando o shape classificado
+Map.addLayer(glacier,{color: '00FF00'},'Glacier',1,0.5);
+
+//Adicionando shape da frente da geleria pelo GLIMS
+Map.addLayer(glims_frente, {color: '00FF00'},'Glacier_byGLIMS',1,0.5);
+
+
+Export.table.toDrive({
+  collection: glacier,
+  description:'vectorsToDriveExample',
+  fileFormat: 'SHP'
+});
